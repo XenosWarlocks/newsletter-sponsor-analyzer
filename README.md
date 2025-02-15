@@ -54,6 +54,9 @@ pip install -r requirements.txt
    scraper = NewsletterScraper(config)
    scraper.scrape_range(start=723, end=700)  # Adjust range as needed
    ```
+   ```bash
+   python scraper.py
+   ```
 
 3. Check the output:
    - Results are saved in `processed_sponsors.csv`
