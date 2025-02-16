@@ -7,7 +7,7 @@ import hashlib
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from typing import List, Optional, Set, Iterator, Dict
+from typing import Optional, Set, Iterator, Dict
 from datetime import datetime, date
 from collections import defaultdict
 from abc import ABC, abstractmethod
