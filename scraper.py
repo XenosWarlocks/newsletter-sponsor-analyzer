@@ -6,10 +6,11 @@ import hashlib
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+print(dir(genai))
 
 from config import SponsorContent, DynamicRateLimiter, ScraperConfig
 from typing import Optional, Set, Iterator, Dict
-from datetime import datetime
+from datetime import datetime, date
 from collections import defaultdict
 from abc import ABC, abstractmethod
 import concurrent.futures
@@ -34,8 +35,8 @@ class ContentProcessor(ABC):
 class GeminiProcessor(ContentProcessor):
     """Gemini AI-based content processor"""
     def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        genai.configure(api_key=api_key) # type: ignore[attr-defined]
+        self.model = genai.GenerativeModel("gemini-2.0-flash") # type: ignore[attr-defined]
 
     def process(self, content: str, issue_number: int) -> Optional[SponsorContent]:
         prompt = self._create_prompt(content)
@@ -48,10 +49,22 @@ class GeminiProcessor(ContentProcessor):
             data = self._parse_response(response.text, issue_number)
             if not data:
                 return None
-
+            
+            # Fix for error 3: Handle None case for sponsorship_date
+            sponsorship_date_str = data.get('sponsorship_date')
+            sponsorship_date: Optional[date] = None
             sponsorship_date = None
-            if data['sponsorship_date']:
-                sponsorship_date = datetime.strptime(data['sponsorship_date'], '%Y-%m-%d').date()
+            if sponsorship_date_str:
+                try:
+                    sponsorship_date = datetime.strptime(sponsorship_date_str, '%Y-%m-%d').date()
+                except ValueError:
+                    logger.error(f"Invalid date format in issue {issue_number}")
+                    return None
+            
+            # Make sure sponsorship_date is not None before creating SponsorContent
+            if sponsorship_date is None:
+                logger.error(f"Missing sponsorship date for issue {issue_number}")
+                return None
 
             return SponsorContent(
                 issue_number=issue_number,
@@ -62,6 +75,7 @@ class GeminiProcessor(ContentProcessor):
                 content_hash=hashlib.md5(content.encode('utf-8')).hexdigest(),
                 processed_at=datetime.now()
             )
+        
         except Exception as e:
             logger.error(f"AI processing failed for issue {issue_number}: {str(e)}")
             return None
@@ -139,24 +153,33 @@ class ContentExtractor:
     def extract_sponsor_content(self, html: str, issue_number: int) -> Iterator[str]:
         soup = BeautifulSoup(html, "html.parser")
         for table in soup.find_all("table"):
-            if table.find("span", class_="tag-sponsor"):
+            # Fix for error 4: Add None check before calling find
+            sponsor_tag = table.find("span", class_="tag-sponsor")
+            if sponsor_tag:
                 company_name = self._extract_company_name(table)
                 if company_name and company_name.lower() in self.processed_companies[issue_number]:
                     logger.info(f"Skipping duplicate sponsor {company_name} in issue {issue_number}")
                     continue
-                
+
                 if company_name:
                     self.processed_companies[issue_number].add(company_name.lower())
                 yield str(table)
 
     def _extract_company_name(self, table: BeautifulSoup) -> Optional[str]:
         # Company name extraction logic
+        # Fix for error 4: Improved company name extraction with proper None checks
         sponsor_tag = table.find("span", class_="tag-sponsor")
-        if sponsor_tag and sponsor_tag.find_parent("td"):
-            parent_cell = sponsor_tag.find_parent("td")
-            if strong_tag := (parent_cell.find("strong") or parent_cell.find("b")):
-                return strong_tag.text.strip()
-        return None
+        if not sponsor_tag:
+            return None
+        
+        parent_cell = sponsor_tag.find_parent("td")
+        if not parent_cell:
+            return None
+        
+        strong_tag = parent_cell.find("strong") or parent_cell.find("b")
+        if not strong_tag:
+            return None
+        return strong_tag.text.strip()
 
 class CSVWriter:
     """Handles CSV file operations"""
@@ -288,7 +311,7 @@ class NewsletterScraper:
 
 def main():
     config = ScraperConfig(
-        api_key="API_KEYS",
+        api_key="*******************************",
         output_file=Path("processed_sponsors.csv")
     )
     
@@ -296,7 +319,7 @@ def main():
     
     try:
         logger.info("Starting newsletter scraping batch process")
-        scraper.scrape_range(start=000, end=000)
+        scraper.scrape_range(start=733, end=633)
         logger.info("Scraping process completed successfully")
     except Exception as e:
         logger.critical(f"Batch process failed with error: {str(e)}")
@@ -305,3 +328,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
