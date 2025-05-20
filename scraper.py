@@ -1,16 +1,18 @@
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
 import csv
-import time
 import logging
 import hashlib
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+
+from config import SponsorContent, DynamicRateLimiter, ScraperConfig
 from typing import Optional, Set, Iterator, Dict
-from datetime import datetime, date
+from datetime import datetime
 from collections import defaultdict
 from abc import ABC, abstractmethod
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(
@@ -22,33 +24,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-@dataclass
-class SponsorContent:
-    """Data class for processed sponsor content"""
-    issue_number: int
-    company_name: str
-    website: str
-    industry: str
-    sponsorship_date: date
-    content_hash: str
-    processed_at: datetime
-
-class ScraperConfig:
-    """Configuration management"""
-    def __init__(self, api_key: str, output_file: Path):
-        self.api_key = api_key
-        self.output_file = output_file
-        self.base_url = "https://javascriptweekly.com/issues/{}"
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        self.rate_limits = {
-            'scrape_delay': 2,
-            'ai_delay': 5,
-            'ai_error_delay': 30,
-            'max_retries': 5
-        }
 
 class ContentProcessor(ABC):
     """Abstract base class for content processors"""
@@ -74,12 +49,16 @@ class GeminiProcessor(ContentProcessor):
             if not data:
                 return None
 
+            sponsorship_date = None
+            if data['sponsorship_date']:
+                sponsorship_date = datetime.strptime(data['sponsorship_date'], '%Y-%m-%d').date()
+
             return SponsorContent(
                 issue_number=issue_number,
                 company_name=data['company_name'],
                 website=self._clean_website(data['website']),
                 industry=data['industry'],
-                sponsorship_date=datetime.strptime(data['sponsorship_date'], '%Y-%m-%d').date(),
+                sponsorship_date=sponsorship_date,
                 content_hash=hashlib.md5(content.encode('utf-8')).hexdigest(),
                 processed_at=datetime.now()
             )
@@ -142,11 +121,11 @@ class GeminiProcessor(ContentProcessor):
             return None
 
     def _clean_website(self, website: str) -> str:
-        if "javascriptweekly.com/link" in website:
+        if "frontendfoc.us/link" in website:
             # Strip tracking parameters and redirects
             try:
                 # Extract actual website from tracking URL if possible
-                parsed_url = website.split("javascriptweekly.com/link/")[-1].split("/")[1]
+                parsed_url = website.split("frontendfoc.us/link/")[-1].split("/")[1]
                 return f"https://{parsed_url}"
             except:
                 return website
@@ -201,10 +180,10 @@ class CSVWriter:
             writer.writerow(asdict(content))
 
 class NewsletterScraper:
-    """Main scraper class"""
+    """Main scraper class with parallel processing and dynamic rate limiting"""
     def __init__(self, config: ScraperConfig):
         self.config = config
-        self.session = self._create_session()
+        self.rate_limiter = DynamicRateLimiter()
         self.extractor = ContentExtractor()
         self.processor = GeminiProcessor(config.api_key)
         self.writer = CSVWriter(config.output_file)
@@ -215,50 +194,114 @@ class NewsletterScraper:
         return session
 
     def scrape_range(self, start: int, end: int):
-        """Scrape a range of newsletter issues"""
-        for issue_num in range(start, end - 1, -1):
-            try:
-                self._process_issue(issue_num)
-            except Exception as e:
-                logger.error(f"Failed to process issue {issue_num}: {str(e)}")
-                continue
+        """Parallel scraping of newsletter issues"""
+        # Ensure we scrape in descending order
+        issue_range = list(range(start, end - 1, -1))
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.rate_limits['max_workers']
+        ) as executor:
+            # Submit all tasks
+            future_to_issue = {
+                executor.submit(self._process_issue, issue_num): issue_num
+                for issue_num in issue_range
+            }
+
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_issue):
+                issue_num = future_to_issue[future]
+                try:
+                    future.result() # This will raise any exceptions that occurred
+                except Exception as e:
+                    logger.error(f"Failed to process issue {issue_num}: {str(e)}")
+                    
+            # Wait for all tasks to complete - this is redundant with as_completed but ensures clarity
+            logger.info("Waiting for all processing tasks to complete...")
+            concurrent.futures.wait(future_to_issue.keys())
+            logger.info("All processing tasks completed")
 
     def _process_issue(self, issue_num: int):
+        """Process a single newsletter issue with rate limiting"""
         logger.info(f"Processing issue {issue_num}")
-        response = self._fetch_with_retry(issue_num)
-        if not response:
+        
+        try:
+            # Fetch the issue with exponential backoff
+            response = self._fetch_with_retry(issue_num)
+            if not response:
+                logger.warning(f"Could not fetch issue {issue_num}, skipping")
+                return
+
+            # Process sponsor contents
+            processed_count = 0
+            sponsors_found = 0
+            for content in self.extractor.extract_sponsor_content(response.text, issue_num):
+                sponsors_found += 1
+                try:
+                    # Apply rate limiting before AI processing
+                    self.rate_limiter.wait()
+                    
+                    if processed := self.processor.process(content, issue_num):
+                        self.writer.append_content(processed)
+                        processed_count += 1
+                        logger.info(f"Successfully processed sponsor for issue {issue_num}")
+                except Exception as e:
+                    logger.error(f"Failed to process sponsor content in issue {issue_num}: {str(e)}")
+            
+            # Reset rate limiter if processing was successful
+            if processed_count > 0:
+                self.rate_limiter.reset()
+            
+            logger.info(f"Issue {issue_num} processing completed. Found {sponsors_found} sponsors, processed {processed_count}.")
+            
+        except Exception as e:
+            logger.error(f"Unexpected error processing issue {issue_num}: {str(e)}")
+            # Still return successfully to not break the batch process
             return
 
-        for content in self.extractor.extract_sponsor_content(response.text, issue_num):
-            try:
-                if processed := self.processor.process(content, issue_num):
-                    self.writer.append_content(processed)
-                    logger.info(f"Successfully processed sponsor for issue {issue_num}")
-                time.sleep(self.config.rate_limits['ai_delay'])
-            except Exception as e:
-                logger.error(f"Failed to process sponsor content in issue {issue_num}: {str(e)}")
-
     def _fetch_with_retry(self, issue_num: int) -> Optional[requests.Response]:
+        """Fetch issue with dynamic rate limiting and retries"""
         url = self.config.base_url.format(issue_num)
-        for attempt in range(self.config.rate_limits['max_retries']):
+        session = self._create_session()
+        
+        for attempt in range(5):  # Maximum 5 attempts
             try:
-                response = self.session.get(url)
+                # Apply rate limiting before request
+                self.rate_limiter.wait()
+                
+                response = session.get(
+                    url, 
+                    timeout=self.config.rate_limits['request_timeout']
+                )
                 response.raise_for_status()
+                
+                # Reset rate limiter on successful request
+                self.rate_limiter.reset()
                 return response
-            except requests.RequestException as e:
+            
+            except (requests.RequestException, requests.Timeout) as e:
                 logger.warning(f"Attempt {attempt + 1} failed for issue {issue_num}: {str(e)}")
-                if attempt < self.config.rate_limits['max_retries'] - 1:
-                    time.sleep(self.config.rate_limits['scrape_delay'])
+                # The rate limiter's wait will progressively increase delay
+                self.rate_limiter.backoff()
+        
+        logger.error(f"Failed to fetch issue {issue_num} after maximum retries")
         return None
 
 def main():
     config = ScraperConfig(
-        api_key="Your_API_Key",
+        api_key="API_KEYS",
         output_file=Path("processed_sponsors.csv")
     )
     
     scraper = NewsletterScraper(config)
-    scraper.scrape_range(start=723, end=700)
+    
+    try:
+        logger.info("Starting newsletter scraping batch process")
+        scraper.scrape_range(start=000, end=000)
+        logger.info("Scraping process completed successfully")
+    except Exception as e:
+        logger.critical(f"Batch process failed with error: {str(e)}")
+    finally:
+        logger.info("Batch process execution finished")
 
 if __name__ == "__main__":
     main()
